@@ -63,11 +63,21 @@ function isHostElement {
   [[ "$1" =~ ^[a-z]+$ ]]
 }
 
+function getJsonType {
+  echo "$1" | jq -r '. | type'
+}
+
+function isJsxElement {
+  local type
+  type="$(getJsonType "$1")"
+  [ "$type" = "object" ]
+}
+
 function renderNode {
   local element="$1"
   
   local kind;
-  kind="$(echo "$element" | jq -r '. | type')" # string, number, boolean, null, object, array
+  kind="$(getJsonType "$element")" # string, number, boolean, null, object, array
   # log "renderNode[$kind]: $element" >&2
   case "$kind" in
     string|number|boolean|null)
@@ -79,8 +89,47 @@ function renderNode {
       local length
       length=$(echo "$element" | jq '. | length')
       {
+        declare -a tasks
+        local task
+        declare -a syncResults
+        local syncResult
+        local childElement
+        local status
         for ((i=0;i<length;i++)); do
-          renderNode "$(get "$element" "[$i]")"
+          childElement="$(get "$element" "[$i]")"
+          if isJsxElement "$childElement"; then
+            task="$(createTask renderNode "$childElement")"
+            tasks[$i]="$task"
+            # TODO: check for fast finish?
+            syncResults[$i]=''
+          else
+            syncResult="$(renderNode "$childElement")"
+            tasks[$i]=''
+            syncResults[$i]="$syncResult"
+          fi
+        done
+        for ((i=0;i<length;i++)); do
+          task="${tasks[$i]}"
+          if [ -z "$task" ]; then
+            echo "${syncResults[$i]}"
+          else
+            # log "renderNode :: awaiting task $task"
+            awaitTask "$task" >/dev/null
+            status="$(getTaskStatus "$task")"
+            if [ "$status" = 'fulfilled' ]; then
+              cat "$(get "$task" 'result' -r)"
+              # log "renderNode :: awaited ($status)";
+              # local result
+              # result="$(cat "$(get "$task" 'result' -r)")"
+              # log "renderNode :: task result: $result"
+              # echo "$result"
+            else
+              # log "renderNode :: awaited ($status)";
+              local errorFile
+              errorFile="$(get "$task" 'error' -r)"
+              echo null | jq '{ "type": "error", "props": { "message": message } }' --arg message "$(cat "$errorFile")"
+            fi
+          fi
         done
       } | jq -s
       return 0
@@ -102,11 +151,16 @@ function renderElement {
     componentChildren=$(get "$componentProps" 'children' || echo '[]')
     local childrenRendered
     childrenRendered="$(renderNode "$componentChildren")"
+    if [ -z "$childrenRendered" ]; then
+      childrenRendered="null"
+    fi
     # log "renderElement[$componentType] children: $componentChildren of '$componentType' rendered: $childrenRendered" >&2
     echo "$element" | jq '.props.children=$newChildren' --argjson newChildren "$childrenRendered"
   else
     local rendered
-    rendered="$($componentType "$componentProps")"
+    # local task
+    # task="$(createTask "$componentType" "$componentProps")"
+    rendered="$("$componentType" "$componentProps")"
     renderNode "$rendered"
   fi
 }
@@ -161,7 +215,10 @@ function renderElementToFlight {
   componentChildren=$(get "$componentProps" 'children' || echo '[]')
   local childrenRendered
   childrenRendered="$(renderNodeToFlight "$componentChildren")"
-  # log "renderElement[$componentType] children: $componentChildren of '$componentType' rendered: $childrenRendered" >&2
+  if [ -z "$childrenRendered" ]; then
+    childrenRendered="null"
+  fi
+  # log "renderElement[$componentType] children: $componentChildren of '$componentType' rendered: $childrenRendered"
   
   local serializedProps
   # TODO: proper serialization
@@ -171,47 +228,19 @@ function renderElementToFlight {
 
 # =============================================================
 
-function MyComponent {
-  local props="$1"
-  jsx div children="$(
-    text "Hello from MyComponent, x is $(get "$props" 'x')"
-    jsx Child i=0
-    get "$props" 'children'
-  )"
-}
-
-function Child {
-  local props="$1"
-  jsx span children="$(
-    text "Hello from Child number $(get "$props" 'i')"
-  )"
-}
-
-# tree="$(
-#   jsx MyComponent x=1 y=2 children="$({
-#     jsx Child i=1
-#     jsx Child i=2
-#   })"
-# )"
-
-# renderToFlight "$tree"
-
-# =============================================================
-
-function testTask {
-  log "  testTask :: starting";
-  sleep 2;
-  log "  testTask :: done sleeping";
-  echo "done";
-  log "  testTask :: write 1 done";
-  echo "even more done";
-  # return 1
+# function testTask {
+#   log "  testTask :: starting";
+#   sleep 2;
+#   log "  testTask :: done sleeping";
+#   echo "done";
+#   log "  testTask :: write 1 done";
+#   echo "even more done";
   
-  echo "testTask :: oopsie" >&2
-  exit 1
+#   # echo "testTask :: oopsie" >&2
+#   # exit 1
 
-  log "  testTask :: write 2 done";
-}
+#   log "  testTask :: write 2 done";
+# }
 
 
 STATE_DIR=$(mktemp -d)
@@ -226,16 +255,20 @@ exec 3> "$LOG_OUTPUT_FILE"
 export LOG_OUTPUT="$LOG_OUTPUT_FILE"
 
 function log {
-  local output
-  output="${LOG_OUTPUT-}"
+  local output="${LOG_OUTPUT-}"
+  local taskId="${TASK_ID-}"
+  local prefix=""
+  if [ -n "$taskId" ]; then
+    prefix="[$taskId]"
+  fi
   # echo "log :: output is $output"
   if [ -n "$output" ]; then
     # echo "log :: writing to file $output"
     # echo "$@" >>"$output"
-    echo "$@" >&3
+    echo "$prefix" "$@" >&3
   else
     # echo "log :: writing to stderr"
-    echo "$@" >&2
+    echo "$prefix" "$@" >&2
   fi
 }
 
@@ -260,13 +293,30 @@ function createTaskId {
 
 mkdir "$STATE_DIR/tasks"
 
+realJq="$(which jq)"
+function jq {
+  "$realJq" -c "$@"
+
+  # local input
+  # input="$(cat /dev/fd/0)"
+
+  # local exitCode
+  # echo "$input" | "$realJq" "$@"
+  # exitCode="$?"
+  # if [ $exitCode -ne 0 ]; then
+  #   log "jq failed for args: '$@' and input '$input'"
+  # fi
+  # return "$exitCode"
+}
+export -f jq
+
 function createTask {
   local resultDir;
   local statusFile; local resultFile; local errorFile;
   local taskId;
   taskId=$(createTaskId)
   # shellcheck disable=SC2145
-  log "createTask :: $@ (task id: $taskId)"
+  log "createTask[$taskId] :: $@"
   resultDir="$STATE_DIR/tasks/$taskId"
   mkdir "$resultDir"
 
@@ -278,14 +328,16 @@ function createTask {
   local pid
   (
     set +e
-    log "subshell :: started"
+    export TASK_ID="$taskId"
+    # log "subshell :: started"
     # run in a subshell in case it calls `exit`
     if ( "$@" >"$resultFile" 2>"$errorFile" ); then
-      log "subshell :: done"
+      log "createTask[$taskId] :: fulfilled"
       echo 'fulfilled' > "$statusFile"
       exit 0
     else
-      log "subshell :: errored"
+      # log "subshell :: errored"
+      log "createTask[$taskId] :: rejected"
       exitCode="$?"
       echo 'rejected' > "$statusFile"
       exit "$exitCode"
@@ -295,9 +347,9 @@ function createTask {
   # important! redirect stdout/stderr so that the shell won't wait for this task (https://unix.stackexchange.com/a/419870)
   pid="$!"
 
-  log "createTask :: got pid $pid"
+  # log "createTask :: got pid $pid"
   echo "{\"taskId\":$taskId,\"pid\":$pid,\"status\":\"$statusFile\",\"result\":\"$resultFile\",\"error\":\"$errorFile\"}"
-  log "createTask :: exiting"
+  # log "createTask :: exiting"
   return 0
 }
 
@@ -311,30 +363,96 @@ function anywait {
   fi
 }
 
+function getTaskStatus {
+  local task="$1"
+  local statusFile
+  statusFile=$(get "$task" 'status' -r)
+  local taskId
+  taskId=$(get "$task" 'taskId' -r)
+  read <"$statusFile" status || { log "getTaskStatus[$taskId] :: failed to read status for task '$task'"; return 1; }
+  echo "$status"
+}
 
-task=$( (createTask testTask 1 2 3) )
-log "main :: got $task"
-tree "$STATE_DIR" >&2
-
-statusFile=$(get "$task" 'status' -r)
-read <"$statusFile" status;
-if [ "$status" = 'fulfilled' ]; then
-  log "runner :: finished fast ($status)";
-  cat "$(get "$task" 'result' -r)"
-else
-  log "runner :: waiting ($status)";
+function awaitTask {
+  local task="$1"
   anywait "$(get "$task" 'pid')" || true
-  read <"$statusFile" status;
+  local status;
+  status="$(getTaskStatus "$task")"
 
   if [ "$status" = 'fulfilled' ]; then
-    log "runner :: awaited ($status)";
+    # log "runner :: awaited ($status)";
+    # cat "$(get "$task" 'result' -r)"
+    echo "$status"
+    return 0
+  else
+    # log "runner :: awaited ($status)";
+    # cat "$(get "$task" 'error' -r)" >&2
+    echo "$status"
+    return 1
+  fi
+}
+
+function tryResolveTask {
+  local task="$1"
+  local status
+  status="$(getTaskStatus "$task")"
+  
+  if [ "$status" = 'fulfilled' ]; then
+    log "runner :: finished fast ($status)";
     cat "$(get "$task" 'result' -r)"
   else
-    log "runner :: awaited ($status)";
-    cat "$(get "$task" 'error' -r)" >&2
-  fi
+    log "runner :: waiting ($status)";
+    awaitTask "$task" >/dev/null
+    status="$(getTaskStatus "$task")"
 
-  log "runner :: finished";
-fi
+    if [ "$status" = 'fulfilled' ]; then
+      log "runner :: awaited ($status)";
+      cat "$(get "$task" 'result' -r)"
+    else
+      log "runner :: awaited ($status)";
+      cat "$(get "$task" 'error' -r)" >&2
+    fi
+
+    log "runner :: finished";
+  fi
+}
+
+# task=$( (createTask testTask 1 2 3) )
+# log "main :: got $task"
+# tree "$STATE_DIR" >&2
+# tryResolveTask "$task"
+
+
+function MyComponent {
+  local props="$1"
+  jsx div children="$(
+    text "Hello from MyComponent, x is $(get "$props" 'x')"
+    jsx Child i=0
+    get "$props" 'children'
+  )"
+}
+
+function Child {
+  local props="$1"
+  log "Child $(get "$props" 'i') :: sleeping"
+  sleep 2
+  log "Child $(get "$props" 'i') :: woken up"
+  jsx span children="$(
+    text "Hello from Child number $(get "$props" 'i')"
+  )"
+}
+
+tree="$(
+  jsx MyComponent x=1 y=2 children="$({
+    jsx Child i=1
+    jsx Child i=2
+  })"
+)"
+
+# set -x
+renderToFlight "$tree"
+
+# =============================================================
+
 
 # cat "$LOG_OUTPUT_FILE" >&2
