@@ -319,24 +319,14 @@ function logUser {
 
 
 
-function ensureAtomicVar {
+function ensureVar {
   local baseDir="$1"
   local varName="$2"
   local dir="$STATE_DIR/$baseDir"
-  mkdir -p "$dir"
+  [ -d "$dir" ] ||  mkdir -p "$dir"
   if ! [ -f "$dir/$varName" ]; then
     echo 0 > "$dir/$varName"
-    touch "$dir/$varName.lock"
-  fi
-}
-
-function lockAtomicVar {
-  local baseDir="$1"
-  local varName="$2"
-  local dir="$STATE_DIR/$baseDir"
-
-   if [ "$HAS_FLOCK" -eq 0 ]; then
-    flock --exclusive "$dir/$varName.lock"
+    # touch "$dir/$varName.lock"
   fi
 }
 
@@ -344,58 +334,48 @@ function incrPending {
   local baseDir="$1"
   local dir="$STATE_DIR/$baseDir"
   local varName="pending"
-  ensureAtomicVar "$baseDir" "$varName"
-  (
-    lockAtomicVar "$baseDir" "$varName"
-    local currentValue;
-    read <"$dir/$varName" currentValue;
-    log "incrPending[$baseDir] from $currentValue"
-    echo $((currentValue+1)) > "$dir/$varName"
-  )
+  ensureVar "$baseDir" "$varName"
+
+  local currentValue;
+  read <"$dir/$varName" currentValue;
+  log "incrPending[$baseDir] from $currentValue"
+  echo $((currentValue+1)) > "$dir/$varName"
 }
 
 function decrPending {
   local baseDir="$1"
   local dir="$STATE_DIR/$baseDir"
   local varName="pending"
-  ensureAtomicVar "$baseDir" "$varName"
-  (
-    lockAtomicVar "$baseDir" "$varName"
-    local currentValue;
-    read <"$dir/$varName" currentValue;
-    log "decrPending[$baseDir] from $currentValue"
-    echo $((currentValue-1)) > "$dir/$varName"
-  )
+  ensureVar "$baseDir" "$varName"
+
+  local currentValue;
+  read <"$dir/$varName" currentValue;
+  log "decrPending[$baseDir] from $currentValue"
+  echo $((currentValue-1)) > "$dir/$varName"
 }
 
 function getPending {
   local baseDir="$1"
   local dir="$STATE_DIR/$baseDir"
   local varName="pending"
-  ensureAtomicVar "$baseDir" "$varName"
-  (
-    lockAtomicVar "$baseDir" "$varName"
-    local currentValue;
-    read <"$dir/$varName" currentValue;
-    echo "$currentValue"
-  )
+  ensureVar "$baseDir" "$varName"
+  
+  local currentValue;
+  read <"$dir/$varName" currentValue;
+  echo "$currentValue"
 }
 
 
-# atomic counter for ids via flock
-HAS_FLOCK=$(which flock; echo $?)
 function createTaskId {
   local baseDir="$1"
   local dir="$STATE_DIR/$baseDir"
   local varName="currentId"
-  ensureAtomicVar "$baseDir" "$varName"
-  (
-    lockAtomicVar "$baseDir" "$varName"
-    local currentValue;
-    read <"$dir/$varName" currentValue;
-    echo $((currentValue+1)) > "$dir/$varName"
-    echo "$currentValue"
-  )
+  ensureVar "$baseDir" "$varName"
+
+  local currentValue;
+  read <"$dir/$varName" currentValue;
+  echo $((currentValue+1)) > "$dir/$varName"
+  echo "$currentValue"
 }
 
 realJq="$(which jq)"
