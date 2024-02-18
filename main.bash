@@ -257,7 +257,7 @@ function renderToFlight {
   local numPendingChunks
   while true; do
     numPendingChunks="$(getPending "chunks")"
-    log "renderToFlight :: pending chunks $numPendingChunks"
+    # log "renderToFlight :: pending chunks $numPendingChunks"
     if [ "$numPendingChunks" -eq 0 ]; then
       break
     else
