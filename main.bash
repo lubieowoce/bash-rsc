@@ -91,10 +91,6 @@ function renderNode {
   esac
 }
 
-function log {
-  echo "$@" >&2
-}
-
 function renderElement {
   local element="$1"
   local componentType; local componentProps
@@ -191,11 +187,154 @@ function Child {
   )"
 }
 
-tree="$(
-  jsx MyComponent x=1 y=2 children="$({
-    jsx Child i=1
-    jsx Child i=2
-  })"
-)"
+# tree="$(
+#   jsx MyComponent x=1 y=2 children="$({
+#     jsx Child i=1
+#     jsx Child i=2
+#   })"
+# )"
 
-renderToFlight "$tree"
+# renderToFlight "$tree"
+
+# =============================================================
+
+function testTask {
+  log "  testTask :: starting";
+  sleep 2;
+  log "  testTask :: done sleeping";
+  echo "done";
+  log "  testTask :: write 1 done";
+  echo "even more done";
+  # return 1
+  
+  echo "testTask :: oopsie" >&2
+  exit 1
+
+  log "  testTask :: write 2 done";
+}
+
+
+STATE_DIR=$(mktemp -d)
+# log "state dir: $STATE_DIR"
+
+LOG_OUTPUT_FILE="$STATE_DIR/stderr"
+ln -sf /dev/fd/2 "$LOG_OUTPUT_FILE"
+exec 3> "$LOG_OUTPUT_FILE"
+# echo "test log to $LOG_OUTPUT_FILE" > "$LOG_OUTPUT_FILE"
+
+# make all logs go to our stderr.
+export LOG_OUTPUT="$LOG_OUTPUT_FILE"
+
+function log {
+  local output
+  output="${LOG_OUTPUT-}"
+  # echo "log :: output is $output"
+  if [ -n "$output" ]; then
+    # echo "log :: writing to file $output"
+    # echo "$@" >>"$output"
+    echo "$@" >&3
+  else
+    # echo "log :: writing to stderr"
+    echo "$@" >&2
+  fi
+}
+
+log "test log"
+
+
+# atomic counter for ids via flock
+echo 1 > "$STATE_DIR/currentTaskId"
+touch "$STATE_DIR/currentTaskId.lock"
+HAS_FLOCK=$(which flock; echo $?)
+function createTaskId {
+  (
+    if [ "$HAS_FLOCK" -eq 0 ]; then
+      flock --exclusive "$STATE_DIR/currentTaskId.lock"
+    fi
+    local currentTaskId;
+    read <"$STATE_DIR/currentTaskId" currentTaskId;
+    echo $((currentTaskId+1)) > "$STATE_DIR/currentTaskId"
+    echo "$currentTaskId"
+  )
+}
+
+mkdir "$STATE_DIR/tasks"
+
+function createTask {
+  local resultDir;
+  local statusFile; local resultFile; local errorFile;
+  local taskId;
+  taskId=$(createTaskId)
+  # shellcheck disable=SC2145
+  log "createTask :: $@ (task id: $taskId)"
+  resultDir="$STATE_DIR/tasks/$taskId"
+  mkdir "$resultDir"
+
+  statusFile="$resultDir/status"
+  resultFile="$resultDir/result"
+  errorFile="$resultDir/error"
+  echo 'pending' > "$statusFile"
+
+  local pid
+  (
+    set +e
+    log "subshell :: started"
+    # run in a subshell in case it calls `exit`
+    if ( "$@" >"$resultFile" 2>"$errorFile" ); then
+      log "subshell :: done"
+      echo 'fulfilled' > "$statusFile"
+      exit 0
+    else
+      log "subshell :: errored"
+      exitCode="$?"
+      echo 'rejected' > "$statusFile"
+      exit "$exitCode"
+    fi
+  ) >/dev/null 2>"$LOG_OUTPUT" &
+  # ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  # important! redirect stdout/stderr so that the shell won't wait for this task (https://unix.stackexchange.com/a/419870)
+  pid="$!"
+
+  log "createTask :: got pid $pid"
+  echo "{\"taskId\":$taskId,\"pid\":$pid,\"status\":\"$statusFile\",\"result\":\"$resultFile\",\"error\":\"$errorFile\"}"
+  log "createTask :: exiting"
+  return 0
+}
+
+UNAME=$(uname)
+function anywait {
+  # https://unix.stackexchange.com/a/427133
+  if [ "$UNAME" == "Linux" ]; then
+      tail --pid=$1 -f /dev/null
+  else
+      lsof -p $1 +r 1 &>/dev/null
+  fi
+}
+
+
+task=$( (createTask testTask 1 2 3) )
+log "main :: got $task"
+tree "$STATE_DIR" >&2
+
+statusFile=$(get "$task" 'status' -r)
+read <"$statusFile" status;
+if [ "$status" = 'fulfilled' ]; then
+  log "runner :: finished fast ($status)";
+  cat "$(get "$task" 'result' -r)"
+else
+  log "runner :: waiting ($status)";
+  anywait "$(get "$task" 'pid')" || true
+  read <"$statusFile" status;
+
+  if [ "$status" = 'fulfilled' ]; then
+    log "runner :: awaited ($status)";
+    cat "$(get "$task" 'result' -r)"
+  else
+    log "runner :: awaited ($status)";
+    cat "$(get "$task" 'error' -r)" >&2
+  fi
+
+  log "runner :: finished";
+fi
+
+# cat "$LOG_OUTPUT_FILE" >&2
