@@ -399,6 +399,9 @@ function createTaskId {
 }
 
 realJq="$(which jq)"
+if [ $? != 0 ]; then
+  echo "bash-rsc requires jq to run (developed with jq 1.6)" >&2
+fi
 function jq {
   "$realJq" -c "$@"
 
@@ -524,34 +527,7 @@ function awaitTask {
   fi
 }
 
-function tryResolveTask {
-  local task="$1"
-  local status
-  status="$(getTaskStatus "$task")"
-  
-  if [ "$status" = 'fulfilled' ]; then
-    log "runner :: finished fast ($status)";
-    cat "$(get "$task" 'result' -r)"
-  else
-    log "runner :: waiting ($status)";
-    awaitTask "$task" >/dev/null
-    status="$(getTaskStatus "$task")"
-
-    if [ "$status" = 'fulfilled' ]; then
-      log "runner :: awaited ($status)";
-      cat "$(get "$task" 'result' -r)"
-    else
-      log "runner :: awaited ($status)";
-      cat "$(get "$task" 'error' -r)" >&2
-    fi
-
-    log "runner :: finished";
-  fi
-}
-
-# task=$( (createTask testTask 1 2 3) )
-# log "main :: got $task"
-# tryResolveTask "$task"
+# =============================================================
 
 
 function MyComponent {
@@ -587,17 +563,7 @@ renderToFlight "$tree"
 
 
 
-
-
-
-
-
-
-
-
-
-
-
+# =============================================================
 
 
 if [ "${NO_INTERNAL_LOGS-0}" != "1" ]; then 
