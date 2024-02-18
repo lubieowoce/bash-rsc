@@ -155,7 +155,11 @@ function renderElement {
       childrenRendered="null"
     fi
     # log "renderElement[$componentType] children: $componentChildren of '$componentType' rendered: $childrenRendered" >&2
-    echo "$element" | jq '.props.children=$newChildren' --argjson newChildren "$childrenRendered"
+    # echo "$element" | jq '.props.children=$newChildren' --argjson newChildren "$childrenRendered"
+    local serializedProps
+    # TODO: proper serialization
+    serializedProps="$(echo "$componentProps" | jq '.children=$newChildren' --argjson newChildren "$childrenRendered")"
+    echo "$serializedProps" | jq -c '["$", $type, null, $props]' --arg type "$componentType" --argjson props "$serializedProps"
   else
     local rendered
     # local task
@@ -168,79 +172,10 @@ function renderElement {
 # =============================================================
 
 function renderToFlight {
-  local renderedToJsx
-  renderedToJsx="$(renderNode "$1")"
-  echo "0:$(renderNodeToFlight "$renderedToJsx")"
-}
-
-function renderNodeToFlight {
-  local element="$1"
-  local kind;
-  kind="$(echo "$element" | jq -r '. | type')" # string, number, boolean, null, object, array
-  case "$kind" in
-    string|number|boolean|null)
-      echo "$element"
-      return 0
-      ;;
-    array)
-      # log "renderNode[array]: $element" >&2
-      local length
-      length=$(echo "$element" | jq '. | length')
-      {
-        for ((i=0;i<length;i++)); do
-          renderNodeToFlight "$(get "$element" "[$i]")"
-        done
-      } | jq -s
-      return 0
-      ;;
-    object)
-      renderElementToFlight "$element"
-      return 0
-  esac
-}
-
-function renderElementToFlight {
-  local element="$1"
-  local componentType; local componentProps
-  componentType="$(get "$element" 'type' -r)"
-  componentProps="$(get "$element" 'props')"
-  
-  if ! isHostElement "$componentType"; then
-    echo "renderElementToFlight :: expected all components to be host elements (got: '$componentType')"
-    return 1
-  fi
-
-  local componentChildren
-  # TODO: other props might need rendering too! but that's only for client components
-  componentChildren=$(get "$componentProps" 'children' || echo '[]')
-  local childrenRendered
-  childrenRendered="$(renderNodeToFlight "$componentChildren")"
-  if [ -z "$childrenRendered" ]; then
-    childrenRendered="null"
-  fi
-  # log "renderElement[$componentType] children: $componentChildren of '$componentType' rendered: $childrenRendered"
-  
-  local serializedProps
-  # TODO: proper serialization
-  serializedProps="$(echo "$componentProps" | jq '.children=$newChildren' --argjson newChildren "$childrenRendered")"
-  echo "$serializedProps" | jq -c '["$", $type, null, $props]' --arg type "$componentType" --argjson props "$serializedProps"
+  echo "0:$(renderNode "$1")"
 }
 
 # =============================================================
-
-# function testTask {
-#   log "  testTask :: starting";
-#   sleep 2;
-#   log "  testTask :: done sleeping";
-#   echo "done";
-#   log "  testTask :: write 1 done";
-#   echo "even more done";
-  
-#   # echo "testTask :: oopsie" >&2
-#   # exit 1
-
-#   log "  testTask :: write 2 done";
-# }
 
 
 STATE_DIR=$(mktemp -d)
