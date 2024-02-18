@@ -313,13 +313,19 @@ export -f jq
 function createTask {
   local resultDir;
   local statusFile; local resultFile; local errorFile;
+  local parentTaskId="${TASK_ID-}"
   local taskId;
   taskId=$(createTaskId)
   # shellcheck disable=SC2145
   log "createTask[$taskId] :: $@"
   resultDir="$STATE_DIR/tasks/$taskId"
   mkdir "$resultDir"
-
+  if [ -n "$parentTaskId" ]; then
+    local parentResultDir="$STATE_DIR/tasks/$parentTaskId"
+    ln -s "$parentResultDir" "$resultDir/parent"
+    mkdir -p "$parentResultDir/children"
+    ln -s "$resultDir" "$parentResultDir/children/$taskId"
+  fi
   statusFile="$resultDir/status"
   resultFile="$resultDir/result"
   errorFile="$resultDir/error"
@@ -419,7 +425,6 @@ function tryResolveTask {
 
 # task=$( (createTask testTask 1 2 3) )
 # log "main :: got $task"
-# tree "$STATE_DIR" >&2
 # tryResolveTask "$task"
 
 
@@ -450,7 +455,10 @@ tree="$(
 )"
 
 # set -x
-renderToFlight "$tree"
+renderToFlight "[$tree]"
+
+echo "$STATE_DIR" >&2
+( cd "$STATE_DIR"; tree "$STATE_DIR" ) >&2
 
 # =============================================================
 
