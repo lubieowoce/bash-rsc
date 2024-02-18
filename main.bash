@@ -63,6 +63,10 @@ function isHostElement {
   [[ "$1" =~ ^[a-z]+$ ]]
 }
 
+function isComponent {
+  [[ "$1" =~ ^[A-Z] ]]
+}
+
 function getJsonType {
   echo "$1" | jq -r '. | type'
 }
@@ -127,7 +131,7 @@ function renderNode {
               # log "renderNode :: awaited ($status)";
               local errorFile
               errorFile="$(get "$task" 'error' -r)"
-              echo null | jq '{ "type": "error", "props": { "message": message } }' --arg message "$(cat "$errorFile")"
+              echo null | jq '{ "type": "error", "props": { "message": $message } }' --arg message "$(cat "$errorFile")"
             fi
           fi
         done
@@ -140,15 +144,79 @@ function renderNode {
   esac
 }
 
+function getHexId {
+  printf '%x' "$1"
+}
+
+function emitChunk {
+  local id="$1"
+  local contents="$2"
+  echo "$(getHexId "$id"):$contents" >&4
+}
+
 function renderElement {
   local element="$1"
   local componentType; local componentProps
   componentType="$(get "$element" 'type' -r)"
   componentProps="$(get "$element" 'props')"
   
+  if isComponent "$componentType"; then
+    local rendered
+    # local task
+    # task="$(createTask "$componentType" "$componentProps")"
+    rendered="$("$componentType" "$componentProps")"
+    renderNode "$rendered"
+    return "$?"
+  fi
+
+  local componentChildren
+  componentChildren=$(get "$componentProps" 'children' || echo 'null')
+  if [ "$componentType" = "react.suspense" ]; then
+    local task
+    task="$(createTask renderNode "$componentChildren")"
+    log "renderElement :: suspense task $task"
+    sleep 0.1
+    local status
+    status="$(getTaskStatus "$task")"
+    case "$status" in
+      rejected)
+        log "NOT IMPLEMENTED: suspense can't handle rejections yet"
+        echo "null"
+        return 0
+      ;;
+      fulfilled)
+        local resultFile
+        resultFile="$(get "$task" 'result')"
+        cat "$resultFile"
+      ;;
+      pending)
+        # TODO: wrap this up in createChunkSync?
+        local symbolId
+        symbolId=$(createTaskId "chunks")
+        emitChunk "$symbolId" '"$''Sreact.suspense"'
+
+        local chunk
+        chunk="$(createChunk emitChunkWhenTaskComplete "$task")"
+        local rowId
+        rowId=$(get "$chunk" 'taskId')
+        
+        local suspenseRef='$'"$symbolId"
+        local contentRef='$''L'"$rowId"
+
+        # TODO: this should work for any JSX prop
+        local fallbackProp
+        fallbackProp="$(get "$componentProps" 'fallback' || echo 'null')"
+        fallbackRendered="$(renderNode "$fallbackProp")"
+
+        local fallback='["$","'"$suspenseRef"'",null,{"fallback":'"$fallbackRendered"',"children":"'"$contentRef"'"}]'
+        # fallback=$(get "$fallback" '')
+        # log "suspense fallback $fallback"
+        echo "$fallback"
+      ;;
+    esac
+    return 0
+  fi
   if isHostElement "$componentType"; then
-    local componentChildren
-    componentChildren=$(get "$componentProps" 'children' || echo '[]')
     local childrenRendered
     childrenRendered="$(renderNode "$componentChildren")"
     if [ -z "$childrenRendered" ]; then
@@ -160,19 +228,43 @@ function renderElement {
     # TODO: proper serialization
     serializedProps="$(echo "$componentProps" | jq '.children=$newChildren' --argjson newChildren "$childrenRendered")"
     echo "$serializedProps" | jq -c '["$", $type, null, $props]' --arg type "$componentType" --argjson props "$serializedProps"
-  else
-    local rendered
-    # local task
-    # task="$(createTask "$componentType" "$componentProps")"
-    rendered="$("$componentType" "$componentProps")"
-    renderNode "$rendered"
   fi
+}
+
+function emitChunkWhenTaskComplete {
+  local chunkId="$CHUNK_ID"
+  awaitTask "$task" >/dev/null
+  local resultFile
+  resultFile="$(get "$task" 'result' -r)"
+  local result
+  result="$(cat "$resultFile")"
+  log "suspense :: writing result chunk $result"
+  emitChunk "$chunkId" "$result"
 }
 
 # =============================================================
 
 function renderToFlight {
-  echo "0:$(renderNode "$1")"
+  local chunk
+  chunk="$(createChunk renderNode "$1")"
+
+  awaitTask "$chunk" >/dev/null
+  local contents
+  contents="$(cat "$(get "$chunk" 'result' -r)")"
+  emitChunk "$(get "$chunk" 'taskId')" "$contents"
+
+  # TODO: yuck
+  local numPendingChunks
+  while true; do
+    numPendingChunks="$(getPending "chunks")"
+    log "renderToFlight :: pending chunks $numPendingChunks"
+    if [ "$numPendingChunks" -eq 0 ]; then
+      break
+    else
+      sleep 0.1
+    fi
+  done
+
 }
 
 # =============================================================
@@ -189,44 +281,122 @@ exec 3> "$LOG_OUTPUT_FILE"
 # make all logs go to our stderr.
 export LOG_OUTPUT="$LOG_OUTPUT_FILE"
 
+STREAM_OUTPUT_FILE="$STATE_DIR/stream"
+ln -sf /dev/fd/1 "$STREAM_OUTPUT_FILE"
+exec 4> "$STREAM_OUTPUT_FILE"
+export STREAM_OUTPUT="$STREAM_OUTPUT_FILE"
+
 function log {
+  if [ "${NO_INTERNAL_LOGS-0}" = "1" ]; then
+    return 0
+  fi
   local output="${LOG_OUTPUT-}"
   local taskId="${TASK_ID-}"
   local prefix=""
   if [ -n "$taskId" ]; then
     prefix="[$taskId]"
   fi
-  # echo "log :: output is $output"
   if [ -n "$output" ]; then
-    # echo "log :: writing to file $output"
-    # echo "$@" >>"$output"
     echo "$prefix" "$@" >&3
   else
-    # echo "log :: writing to stderr"
     echo "$prefix" "$@" >&2
   fi
 }
 
-log "test log"
+function logUser {
+  local output="${LOG_OUTPUT-}"
+  local taskId="${TASK_ID-}"
+  local prefix=""
+  if [ -n "$taskId" ]; then
+    prefix="[$taskId]"
+  fi
+  if [ -n "$output" ]; then
+    echo -e "\033[90m$prefix" "$@" "\033[0m" >&3
+  else
+    echo "$prefix" "$@" >&2
+  fi
+}
 
 
-# atomic counter for ids via flock
-echo 1 > "$STATE_DIR/currentTaskId"
-touch "$STATE_DIR/currentTaskId.lock"
-HAS_FLOCK=$(which flock; echo $?)
-function createTaskId {
+
+function ensureAtomicVar {
+  local baseDir="$1"
+  local varName="$2"
+  local dir="$STATE_DIR/$baseDir"
+  mkdir -p "$dir"
+  if ! [ -f "$dir/$varName" ]; then
+    echo 0 > "$dir/$varName"
+    touch "$dir/$varName.lock"
+  fi
+}
+
+function lockAtomicVar {
+  local baseDir="$1"
+  local varName="$2"
+  local dir="$STATE_DIR/$baseDir"
+
+   if [ "$HAS_FLOCK" -eq 0 ]; then
+    flock --exclusive "$dir/$varName.lock"
+  fi
+}
+
+function incrPending {
+  local baseDir="$1"
+  local dir="$STATE_DIR/$baseDir"
+  local varName="pending"
+  ensureAtomicVar "$baseDir" "$varName"
   (
-    if [ "$HAS_FLOCK" -eq 0 ]; then
-      flock --exclusive "$STATE_DIR/currentTaskId.lock"
-    fi
-    local currentTaskId;
-    read <"$STATE_DIR/currentTaskId" currentTaskId;
-    echo $((currentTaskId+1)) > "$STATE_DIR/currentTaskId"
-    echo "$currentTaskId"
+    lockAtomicVar "$baseDir" "$varName"
+    local currentValue;
+    read <"$dir/$varName" currentValue;
+    log "incrPending[$baseDir] from $currentValue"
+    echo $((currentValue+1)) > "$dir/$varName"
   )
 }
 
-mkdir "$STATE_DIR/tasks"
+function decrPending {
+  local baseDir="$1"
+  local dir="$STATE_DIR/$baseDir"
+  local varName="pending"
+  ensureAtomicVar "$baseDir" "$varName"
+  (
+    lockAtomicVar "$baseDir" "$varName"
+    local currentValue;
+    read <"$dir/$varName" currentValue;
+    log "decrPending[$baseDir] from $currentValue"
+    echo $((currentValue-1)) > "$dir/$varName"
+  )
+}
+
+function getPending {
+  local baseDir="$1"
+  local dir="$STATE_DIR/$baseDir"
+  local varName="pending"
+  ensureAtomicVar "$baseDir" "$varName"
+  (
+    lockAtomicVar "$baseDir" "$varName"
+    local currentValue;
+    read <"$dir/$varName" currentValue;
+    echo "$currentValue"
+  )
+}
+
+
+# atomic counter for ids via flock
+HAS_FLOCK=$(which flock; echo $?)
+function createTaskId {
+  local baseDir="$1"
+  local dir="$STATE_DIR/$baseDir"
+  local varName="currentId"
+  ensureAtomicVar "$baseDir" "$varName"
+  (
+    lockAtomicVar "$baseDir" "$varName"
+    local currentValue;
+    read <"$dir/$varName" currentValue;
+    echo $((currentValue+1)) > "$dir/$varName"
+    echo "$currentValue"
+  )
+}
 
 realJq="$(which jq)"
 function jq {
@@ -245,18 +415,36 @@ function jq {
 }
 export -f jq
 
+function createChunk {
+  createTaskBase "chunks" "CHUNK_ID" "$@"
+}
+
 function createTask {
+  createTaskBase "tasks" "TASK_ID" "$@"
+}
+
+function createTaskBase {
+  local baseDirName="$1" 
+  local ctxEnvVarName="$2" 
+  local args=( "$@" )
+  args=( "${args[@]:2}" )
+
   local resultDir;
   local statusFile; local resultFile; local errorFile;
-  local parentTaskId="${TASK_ID-}"
+
+  local baseDir="$STATE_DIR/$baseDirName"
+  local parentTaskId="${!ctxEnvVarName-}"
+  
   local taskId;
-  taskId=$(createTaskId)
+  taskId=$(createTaskId "$baseDirName")
+
   # shellcheck disable=SC2145
-  log "createTask[$taskId] :: $@"
-  resultDir="$STATE_DIR/tasks/$taskId"
+  log "createTask[$baseDirName][$taskId] :: ${args[@]}"
+  
+  resultDir="$baseDir/$taskId"
   mkdir "$resultDir"
   if [ -n "$parentTaskId" ]; then
-    local parentResultDir="$STATE_DIR/tasks/$parentTaskId"
+    local parentResultDir="$baseDir/$parentTaskId"
     ln -s "$parentResultDir" "$resultDir/parent"
     mkdir -p "$parentResultDir/children"
     ln -s "$resultDir" "$parentResultDir/children/$taskId"
@@ -264,23 +452,26 @@ function createTask {
   statusFile="$resultDir/status"
   resultFile="$resultDir/result"
   errorFile="$resultDir/error"
+
   echo 'pending' > "$statusFile"
+  incrPending "$baseDirName"
 
   local pid
   (
     set +e
-    export TASK_ID="$taskId"
+    export "$ctxEnvVarName"="$taskId"
     # log "subshell :: started"
     # run in a subshell in case it calls `exit`
-    if ( "$@" >"$resultFile" 2>"$errorFile" ); then
-      log "createTask[$taskId] :: fulfilled"
+    if ( "${args[@]}" >"$resultFile" 2>"$errorFile" ); then
+      log "createTask[$baseDirName][$taskId] :: fulfilled"
       echo 'fulfilled' > "$statusFile"
+      decrPending "$baseDirName"
       exit 0
     else
-      # log "subshell :: errored"
-      log "createTask[$taskId] :: rejected"
       exitCode="$?"
+      log "createTask[$baseDirName][$taskId] :: rejected"
       echo 'rejected' > "$statusFile"
+      decrPending "$baseDirName"
       exit "$exitCode"
     fi
   ) >/dev/null 2>"$LOG_OUTPUT" &
@@ -365,18 +556,21 @@ function tryResolveTask {
 
 function MyComponent {
   local props="$1"
+  logUser "hello from MyComponent"
   jsx div children="$(
     text "Hello from MyComponent, x is $(get "$props" 'x')"
-    jsx Child i=0
-    get "$props" 'children'
+    jsx react.suspense fallback="$(text "Loading...")" children="$(
+      jsx Child i=0
+      get "$props" 'children'
+    )"
   )"
 }
 
 function Child {
   local props="$1"
-  log "Child $(get "$props" 'i') :: sleeping"
+  logUser "Child $(get "$props" 'i') :: sleeping for 2s"
   sleep 2
-  log "Child $(get "$props" 'i') :: woken up"
+  logUser "Child $(get "$props" 'i') :: woken up"
   jsx span children="$(
     text "Hello from Child number $(get "$props" 'i')"
   )"
@@ -389,13 +583,24 @@ tree="$(
   })"
 )"
 
-# set -x
-renderToFlight "[$tree]"
-
-echo "$STATE_DIR" >&2
-( cd "$STATE_DIR"; tree "$STATE_DIR" ) >&2
-
-# =============================================================
+renderToFlight "$tree"
 
 
-# cat "$LOG_OUTPUT_FILE" >&2
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if [ "${NO_INTERNAL_LOGS-0}" != "1" ]; then 
+  echo "$STATE_DIR" >&2
+  ( cd "$STATE_DIR"; tree "$STATE_DIR" ) >&2
+fi
