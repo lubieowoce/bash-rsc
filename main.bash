@@ -117,6 +117,64 @@ function renderElement {
 
 # =============================================================
 
+function renderToFlight {
+  local renderedToJsx
+  renderedToJsx="$(renderNode "$1")"
+  echo "0:$(renderNodeToFlight "$renderedToJsx")"
+}
+
+function renderNodeToFlight {
+  local element="$1"
+  local kind;
+  kind="$(echo "$element" | jq -r '. | type')" # string, number, boolean, null, object, array
+  case "$kind" in
+    string|number|boolean|null)
+      echo "$element"
+      return 0
+      ;;
+    array)
+      # log "renderNode[array]: $element" >&2
+      local length
+      length=$(echo "$element" | jq '. | length')
+      {
+        for ((i=0;i<length;i++)); do
+          renderNodeToFlight "$(get "$element" "[$i]")"
+        done
+      } | jq -s
+      return 0
+      ;;
+    object)
+      renderElementToFlight "$element"
+      return 0
+  esac
+}
+
+function renderElementToFlight {
+  local element="$1"
+  local componentType; local componentProps
+  componentType="$(get "$element" 'type' -r)"
+  componentProps="$(get "$element" 'props')"
+  
+  if ! isHostElement "$componentType"; then
+    echo "renderElementToFlight :: expected all components to be host elements (got: '$componentType')"
+    return 1
+  fi
+
+  local componentChildren
+  # TODO: other props might need rendering too! but that's only for client components
+  componentChildren=$(get "$componentProps" 'children' || echo '[]')
+  local childrenRendered
+  childrenRendered="$(renderNodeToFlight "$componentChildren")"
+  # log "renderElement[$componentType] children: $componentChildren of '$componentType' rendered: $childrenRendered" >&2
+  
+  local serializedProps
+  # TODO: proper serialization
+  serializedProps="$(echo "$componentProps" | jq '.children=$newChildren' --argjson newChildren "$childrenRendered")"
+  echo "$serializedProps" | jq -c '["$", $type, null, $props]' --arg type "$componentType" --argjson props "$serializedProps"
+}
+
+# =============================================================
+
 function MyComponent {
   local props="$1"
   jsx div children="$(
@@ -140,4 +198,4 @@ tree="$(
   })"
 )"
 
-renderNode "$tree"
+renderToFlight "$tree"
